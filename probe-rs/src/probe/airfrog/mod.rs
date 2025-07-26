@@ -49,7 +49,7 @@ pub enum AirfrogError {
     #[error("Airfrog API error: {0}")]
     ApiError(String),
     /// Invalid URL
-    #[error("Invalid URL: {0}")]
+    #[error("Invalid IP/port: {0}")]
     InvalidUrl(String),
 }
 
@@ -215,9 +215,7 @@ impl ProbeFactory for AirfrogFactory {
 
         //println!("Parsed Airfrog address: {}", address);
         
-        let base_url = format!("http://{}", address);
-        
-        let probe = AirfrogProbe::new(base_url)
+        let probe = AirfrogProbe::new(address.to_string())
             .map_err(|e| DebugProbeError::ProbeCouldNotBeCreated(ProbeCreationError::from(e)))?;
         
         //println!("Successfully created Airfrog probe at {}", probe.base_url);
