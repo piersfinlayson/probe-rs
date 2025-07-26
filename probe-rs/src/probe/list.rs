@@ -5,7 +5,7 @@ use crate::probe::{
 };
 
 use super::{
-    blackmagic, ch347usbjtag, cmsisdap, espusbjtag, ftdi, glasgow, jlink, sifliuart, stlink, wlink,
+    airfrog, blackmagic, ch347usbjtag, cmsisdap, espusbjtag, ftdi, glasgow, jlink, sifliuart, stlink, wlink,
 };
 
 /// Struct to list all attached debug probes
@@ -124,6 +124,7 @@ impl AllProbesLister {
         &sifliuart::SifliUartFactory,
         &glasgow::GlasgowFactory,
         &ch347usbjtag::Ch347UsbJtagFactory,
+        &airfrog::AirfrogFactory,
     ];
 
     /// Create a new lister with all built-in probe drivers.

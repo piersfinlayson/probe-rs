@@ -1421,6 +1421,15 @@ impl ProbeFactory for BlackMagicProbeFactory {
             ));
         }
 
+        // Reject serial numbers that are clearly not BlackMagic devices.
+        if let Some(serial_number) = &selector.serial_number {
+            if serial_number.starts_with("airfrog:") {
+                return Err(DebugProbeError::ProbeCouldNotBeCreated(
+                    ProbeCreationError::NotFound,
+                ));
+            }
+        }
+
         // If the serial number is a valid "address:port" string, attempt to
         // connect to it via TCP.
         if let Some(serial_number) = &selector.serial_number {
@@ -1523,6 +1532,11 @@ impl ProbeFactory for BlackMagicProbeFactory {
             // Since there is no serial specified, we can list all probes.
             return self.list_probes();
         };
+
+        // Reject serial numbers that are clearly not BlackMagic devices.
+        if serial.starts_with("airfrog:") {
+            return vec![];
+        }
 
         // If the selector refers to an IP:port pair, return that as the list of probes.
         let Ok(ip_port) = serial.parse::<SocketAddr>() else {
