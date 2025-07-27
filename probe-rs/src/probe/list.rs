@@ -5,7 +5,8 @@ use crate::probe::{
 };
 
 use super::{
-    airfrog, blackmagic, ch347usbjtag, cmsisdap, espusbjtag, ftdi, glasgow, jlink, sifliuart, stlink, wlink,
+    airfrog, blackmagic, ch347usbjtag, cmsisdap, espusbjtag, ftdi, glasgow, jlink, sifliuart,
+    stlink, wlink,
 };
 
 /// Struct to list all attached debug probes

@@ -68,13 +68,13 @@ cobs = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 
+airfrog-bin = { path="../../airfrog/airfrog-bin", version = "0.1" }
+
 # optional
 hexdump = { version = "0.1", optional = true }
 
 rmp-serde = { version = "1" }
 dunce = "1.0.5"
-
-# Required by the airfrog probe 
 
 [build-dependencies]
 probe-rs-target = { workspace = true, optional = true }
