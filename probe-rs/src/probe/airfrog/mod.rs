@@ -17,23 +17,40 @@ use crate::{
 use std::sync::Arc;
 use crate::architecture::arm::{ArmDebugInterface, sequences::ArmDebugSequence, ArmCommunicationInterface};
 
+const AIRFROG_API_MAX_WORD_COUNT: usize = 1024;
+
 /// Airfrog probe factory
 #[derive(Debug)]
 pub struct AirfrogFactory;
+
+#[derive(Debug)]
+struct WriteBlock {
+    /// Address to write to
+    address: RegisterAddress,
+    /// Data to write
+    data: Vec<u32>,
+}
 
 /// Airfrog probe implementation
 #[derive(Debug)]
 pub struct AirfrogProbe {
     /// Host address 
     host: String,
+
     /// Port number
     port: u16,
+
     /// Current SWD speed in kHz
     current_speed_khz: u32,
+
     /// Whether we're attached to the target
     attached: bool,
+
     /// TCP stream for binary protocol
     stream: Option<std::net::TcpStream>,
+
+    // Queued up AP write blocks to be sent
+    ap_write_blocks: Vec<WriteBlock>,
 }
 
 /// Airfrog-specific errors
@@ -79,6 +96,7 @@ impl AirfrogProbe {
             current_speed_khz: 1000,
             attached: false,
             stream: None,
+            ap_write_blocks: Vec::new(),
         })
     }
 
@@ -246,6 +264,22 @@ impl DebugProbe for AirfrogProbe {
             .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
                 AirfrogError::Io(e)
             ))))?;
+
+        // We don't want to buffer small packets - most of our packets will be small
+        stream.set_nodelay(true)
+            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                AirfrogError::Io(e)
+            ))))?;
+
+        // Set timeouts to avoid hanging indefinitely
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                AirfrogError::Io(e)
+            ))))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(1)))
+            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                AirfrogError::Io(e)
+            ))))?;
         
         // Binary API handshake - send version
         stream.write_all(&[0x01])
@@ -285,9 +319,27 @@ impl DebugProbe for AirfrogProbe {
         Ok(())
     }
 
+    // Doesn't seem to be called by probe-rs when using Ctrl-C to exit probe-rs.
     fn detach(&mut self) -> Result<(), crate::Error> {
-        //println!("Detaching from target");
+        println!("Detaching from target");
         self.attached = false;
+        if let Some(mut stream) = self.stream.take() {
+            // Send binary API disconnect and flush it
+            stream.write_all(&[0xFF])
+                .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                    AirfrogError::Io(e)
+                ))))?;
+            stream.flush()
+                .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                    AirfrogError::Io(e)
+                ))))?;
+
+            // Close the TCP connection
+            stream.shutdown(std::net::Shutdown::Both)
+                .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                    AirfrogError::Io(e)
+                ))))?;
+        }
         self.stream = None;
         Ok(())
     }
@@ -349,6 +401,9 @@ impl DebugProbe for AirfrogProbe {
 
 impl RawDapAccess for AirfrogProbe {
     fn raw_read_register(&mut self, address: RegisterAddress) -> Result<u32, ArmError> {
+        // Flush any other pending operations first
+        self.raw_flush()?;
+
         let (cmd, reg) = match address {
             RegisterAddress::DpRegister(_) => (0x00, address.lsb() as u8), // DP_READ
             RegisterAddress::ApRegister(_) => (0x02, address.lsb() as u8), // AP_READ  
@@ -367,10 +422,15 @@ impl RawDapAccess for AirfrogProbe {
         }
         
         let value = u32::from_le_bytes([response[1], response[2], response[3], response[4]]);
+        //println!("Read register at address: {:?} {value:#010X}", address);
         Ok(value)
     }
 
     fn raw_write_register(&mut self, address: RegisterAddress, value: u32) -> Result<(), ArmError> {
+        // Flush any other pending operations first
+        self.raw_flush()?;
+
+        //println!("Writing value {value:#010X} to address: {address:?}");
         let (cmd, reg) = match address {
             RegisterAddress::DpRegister(_) => (0x01, address.lsb() as u8), // DP_WRITE
             RegisterAddress::ApRegister(_) => (0x03, address.lsb() as u8), // AP_WRITE
@@ -394,6 +454,10 @@ impl RawDapAccess for AirfrogProbe {
     }
 
     fn raw_read_block(&mut self, address: RegisterAddress, values: &mut [u32]) -> Result<(), ArmError> {
+        // Flush any other pending operations first
+        self.raw_flush()?;
+
+        //println!("Reading block from address: {address:?} {}", values.len());
         match address {
             RegisterAddress::DpRegister(_) => {
                 // No DP bulk - use individual reads
@@ -449,17 +513,57 @@ impl RawDapAccess for AirfrogProbe {
         address: RegisterAddress,
         values: &[u32],
     ) -> Result<(), ArmError> {
-        println!("Writing block to address: {:?} {}", address, values.len());
-        // Default implementation - could be optimized later
-        for val in values {
-            self.raw_write_register(address, *val)?;
+        match address {
+            RegisterAddress::DpRegister(_) => {
+                // Flush any other pending operations first
+                self.raw_flush()?;
+
+                // No DP bulk API - use individual writes
+                for val in values {
+                    self.raw_write_register(address, *val)?;
+                }
+            }
+            RegisterAddress::ApRegister(_) => {
+                let block = WriteBlock {
+                    address,
+                    data: values.to_vec(),
+                };
+                self.ap_write_blocks.push(block);
+            }
         }
         Ok(())
     }
 
     fn raw_flush(&mut self) -> Result<(), ArmError> {
-        //println!("Flushing raw DAP access");
-        // HTTP is always flushed
+        let write_blocks: Vec<_> = self.ap_write_blocks.drain(..).collect();
+        
+        if write_blocks.is_empty() {
+            return Ok(());
+        }
+        
+        let first_addr = write_blocks[0].address;
+        let all_same_addr = write_blocks.iter().all(|block| block.address == first_addr);
+        
+        if all_same_addr {
+            let combined_data: Vec<u32> = write_blocks.into_iter()
+                .flat_map(|block| block.data)
+                .collect();
+            
+            // Send in chunks of max size
+            for chunk in combined_data.chunks(AIRFROG_API_MAX_WORD_COUNT) {
+                let chunk_block = WriteBlock {
+                    address: first_addr,
+                    data: chunk.to_vec(),
+                };
+                self.internal_write_ap_block(chunk_block)?;
+            }
+        } else {
+            // Fall back to individual writes
+            for block in write_blocks {
+                self.internal_write_ap_block(block)?;
+            }
+        }
+        
         Ok(())
     }
 
@@ -500,6 +604,48 @@ impl RawDapAccess for AirfrogProbe {
         //println!("Core status notification - not implemented for Airfrog");
         // Not needed for HTTP probe
         Ok(())
+    }
+}
+
+impl AirfrogProbe {
+    fn internal_write_ap_block(&mut self, block: WriteBlock) -> Result<(), ArmError> {
+        let address = block.address;
+        let values = block.data;
+
+        match address {
+            RegisterAddress::DpRegister(_) => unreachable!("DP blocks not supported"),
+            RegisterAddress::ApRegister(_) => {
+                let count=values.len();
+                if count > AIRFROG_API_MAX_WORD_COUNT {
+                    return Err(ArmError::Probe(DebugProbeError::Other(
+                        format!("Bulk write limit exceeded - {AIRFROG_API_MAX_WORD_COUNT} words vs {count}")
+                    )));
+                }
+
+                let reg = address.lsb() as u8;
+                let count = values.len() as u16;
+                
+                // Send: [0x13][reg][count:2][data...]
+                let mut command = vec![0x13, reg];
+                command.extend_from_slice(&count.to_le_bytes());
+                for val in values {
+                    command.extend_from_slice(&val.to_le_bytes());
+                }
+                
+                self.send_command(&command).map_err(Self::to_arm_error)?;
+                
+                // Read: [status]
+                let response = self.read_response(1).map_err(Self::to_arm_error)?;
+                
+                if response[0] != 0x00 {
+                    return Err(ArmError::Probe(DebugProbeError::Other(
+                        format!("Bulk write failed, status: 0x{:02X}", response[0])
+                    )));
+                }
+
+                Ok(())
+            }
+        }
     }
 }
 
