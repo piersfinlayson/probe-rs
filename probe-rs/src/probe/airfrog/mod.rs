@@ -134,6 +134,47 @@ impl AirfrogProbe {
     fn to_arm_error(e: AirfrogError) -> ArmError {
         ArmError::Probe(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))
     }
+    
+    fn internal_write_ap_block(&mut self, block: WriteBlock) -> Result<(), ArmError> {
+        let address = block.address;
+        let values = block.data;
+
+        match address {
+            RegisterAddress::DpRegister(_) => unreachable!("DP blocks not supported"),
+            RegisterAddress::ApRegister(_) => {
+                let count = values.len();
+                if count > API_MAX_WORD_COUNT {
+                    return Err(ArmError::Probe(DebugProbeError::Other(format!(
+                        "Bulk write limit exceeded - {API_MAX_WORD_COUNT} words vs {count}"
+                    ))));
+                }
+
+                let reg = address.lsb();
+                let count = values.len() as u16;
+
+                // Send: [cmd][reg][count:2][data...]
+                let mut command = vec![CMD_AP_BULK_WRITE, reg];
+                command.extend_from_slice(&count.to_le_bytes());
+                for val in values {
+                    command.extend_from_slice(&val.to_le_bytes());
+                }
+
+                self.send_command(&command).map_err(Self::to_arm_error)?;
+
+                // Read: [status]
+                let response = self.read_response(1).map_err(Self::to_arm_error)?;
+
+                if response[0] != OK {
+                    return Err(ArmError::Probe(DebugProbeError::Other(format!(
+                        "Bulk write failed, status: {:#04X}",
+                        response[0]
+                    ))));
+                }
+
+                Ok(())
+            }
+        }
+    }
 }
 
 impl ProbeFactory for AirfrogFactory {
@@ -586,49 +627,6 @@ impl RawDapAccess for AirfrogProbe {
 
     fn core_status_notification(&mut self, _state: CoreStatus) -> Result<(), DebugProbeError> {
         Ok(())
-    }
-}
-
-impl AirfrogProbe {
-    fn internal_write_ap_block(&mut self, block: WriteBlock) -> Result<(), ArmError> {
-        let address = block.address;
-        let values = block.data;
-
-        match address {
-            RegisterAddress::DpRegister(_) => unreachable!("DP blocks not supported"),
-            RegisterAddress::ApRegister(_) => {
-                let count = values.len();
-                if count > API_MAX_WORD_COUNT {
-                    return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                        "Bulk write limit exceeded - {API_MAX_WORD_COUNT} words vs {count}"
-                    ))));
-                }
-
-                let reg = address.lsb();
-                let count = values.len() as u16;
-
-                // Send: [cmd][reg][count:2][data...]
-                let mut command = vec![CMD_AP_BULK_WRITE, reg];
-                command.extend_from_slice(&count.to_le_bytes());
-                for val in values {
-                    command.extend_from_slice(&val.to_le_bytes());
-                }
-
-                self.send_command(&command).map_err(Self::to_arm_error)?;
-
-                // Read: [status]
-                let response = self.read_response(1).map_err(Self::to_arm_error)?;
-
-                if response[0] != OK {
-                    return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                        "Bulk write failed, status: {:#04X}",
-                        response[0]
-                    ))));
-                }
-
-                Ok(())
-            }
-        }
     }
 }
 
