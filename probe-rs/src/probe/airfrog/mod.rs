@@ -137,7 +137,7 @@ impl AirfrogProbe {
         self.send_command(send_data)?;
 
         // Receive the response
-        let result = self.read_response(expected_len);
+        let result = self.read_response(expected_len+1);
         
         // Process all possible error cases
 
@@ -153,7 +153,7 @@ impl AirfrogProbe {
             ))));
         } else if response[0] != OK {
             return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                AirfrogError::ApiError(format!("Probe ommand failed with status: {:#04X}", response[0])),
+                AirfrogError::ApiError(format!("Probe command failed with status: {:#04X}", response[0])),
             ))));
         } else if response.len() != expected_len + 1 {
             return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
@@ -373,7 +373,7 @@ impl DebugProbe for AirfrogProbe {
         // Set the speed, to the default, in case the airfrog was otherwise
         // configured
         self.set_speed_airfrog(self.speed)
-            .map(|_| self.stream = None)
+            .inspect_err(|_| self.stream = None)
     }
 
     // Doesn't seem to be called by probe-rs when using Ctrl-C to exit probe-rs.
