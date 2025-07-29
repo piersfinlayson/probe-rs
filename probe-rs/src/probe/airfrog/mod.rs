@@ -112,6 +112,83 @@ impl AirfrogProbe {
 
 // Binary protocol helpers
 impl AirfrogProbe {
+    // Single function that sends a command, waits for the response, and
+    // checks it was successful.  It handles errors in a command way, allowing
+    // the probe-rs traits to be as simple as possible.
+    //
+    // Arguments:
+    // - send_data: Data to send - a command and, for writes, the data to write
+    // - expected_len: Expected length of the response, not including the
+    //   first, status, byte
+    //
+    // Returns:
+    // - Ok(None) if the command was successful and no data is expected back
+    // - Ok(Some(data)) if the command was successful and data is expected
+    // - Err(DebugProbeError) if there was an error in sending the command,
+    //
+    // If a non zero value was passed in `expected_len`, the response is
+    // guaranteed to be Some(), to allow the caller to unwrap.
+    fn send_recv_read_airfrog(
+        &mut self,
+        send_data: &[u8],
+        expected_len: usize
+    ) -> Result<Option<Vec<u8>>, DebugProbeError> {
+        // Send th command
+        self.send_command(send_data)?;
+
+        // Receive the response
+        let result = self.read_response(expected_len);
+        
+        // Process all possible error cases
+
+        let response = if let Err(e) = result {
+            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))));
+        } else {
+            result.unwrap()
+        };
+
+        if response.is_empty() {
+            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                AirfrogError::InvalidResponse("Empty response from probe".to_string()),
+            ))));
+        } else if response[0] != OK {
+            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                AirfrogError::ApiError(format!("Probe ommand failed with status: {:#04X}", response[0])),
+            ))));
+        } else if response.len() != expected_len + 1 {
+            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                AirfrogError::InvalidResponse(format!(
+                    "Unexpected response length from probe: expected {}, got {}",
+                    expected_len + 1,
+                    response.len()
+                )),
+            ))));
+        }
+
+        // Success!
+        if response.len() == 1 {
+            if expected_len > 0 {
+                // This can only happen if our above logic was flawed, but we
+                // explicitly check it as we guarantee that if `expected_len` is
+                // non-zero, we will return Some(data).
+                Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                    AirfrogError::InvalidResponse("Internal probe-rs drive error - please raise an issue".to_string()),
+                ))))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(Some(response[1..].to_vec()))
+        }
+    }
+
+    // Single function to send a command and expect only the status byte back.
+    fn send_recv_airfrog(&mut self, send_data: &[u8]) -> Result<(), DebugProbeError> {
+        self.send_recv_read_airfrog(send_data, 0)
+            .map(|_| ())
+    }
+
+    // Sends a binary API command command over TCP to the Airfrog probe. 
     fn send_command(&mut self, data: &[u8]) -> Result<(), AirfrogError> {
         let stream = self
             .stream
@@ -121,6 +198,8 @@ impl AirfrogProbe {
         Ok(())
     }
 
+    // Reads a response from the Airfrog probe.  Blocks until the expected
+    // number of bytes have been read.
     fn read_response(&mut self, len: usize) -> Result<Vec<u8>, AirfrogError> {
         let stream = self
             .stream
@@ -131,10 +210,20 @@ impl AirfrogProbe {
         Ok(buf)
     }
 
-    fn to_arm_error(e: AirfrogError) -> ArmError {
-        ArmError::Probe(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))
+    // Sets the speed of the Airfrog probe over the binary API.
+    fn set_speed_airfrog(&mut self, speed: Speed) -> Result<(), DebugProbeError> {
+        // Get airfrog speed based on Speed enum
+        let command = [CMD_SET_SPEED, speed as u8];
+        self.send_recv_airfrog(&command)?;
+
+        // Update our internal view of speed
+        self.speed = speed;
+        Ok(())
     }
 
+    // Write a block of data to a single AP register.  This sends makes a
+    // single binary API call to send all of the data, up to
+    // API_MAX_WORD_COUNT 
     fn internal_write_ap_block(&mut self, block: WriteBlock) -> Result<(), ArmError> {
         let address = block.address;
         let values = block.data;
@@ -159,18 +248,7 @@ impl AirfrogProbe {
                     command.extend_from_slice(&val.to_le_bytes());
                 }
 
-                self.send_command(&command).map_err(Self::to_arm_error)?;
-
-                // Read: [status]
-                let response = self.read_response(1).map_err(Self::to_arm_error)?;
-
-                if response[0] != OK {
-                    return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                        "Bulk write failed, status: {:#04X}",
-                        response[0]
-                    ))));
-                }
-
+                self.send_recv_airfrog(&command)?;
                 Ok(())
             }
         }
@@ -245,25 +323,9 @@ impl DebugProbe for AirfrogProbe {
     }
 
     fn set_speed(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
-        // Get airfrog speed based on kHz (Turbo, Fast, Medium, Slow)
         let speed = Speed::from_khz(speed_khz);
-
-        // Send the command to set the speed
-        let command = [CMD_SET_SPEED, speed as u8];
-        self.send_command(&command)
-            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))?;
-
-        let response = self
-            .read_response(1)
-            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))?;
-        if response[0] != OK {
-            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                AirfrogError::ApiError("Failed to set speed".to_string()),
-            ))));
-        }
-
-        self.speed = speed;
-        Ok(self.speed_khz())
+        self.set_speed_airfrog(speed)
+            .map(|_| self.speed.to_khz())
     }
 
     fn attach(&mut self) -> Result<(), DebugProbeError> {
@@ -303,24 +365,15 @@ impl DebugProbe for AirfrogProbe {
             DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(AirfrogError::Io(e))))
         })?;
 
-        // All good so far
+        // All good so far.  Set self.stream so we can use our internal
+        // methods.  However, if we fail in this function, we have to set this
+        // back to None.
         self.stream = Some(stream);
 
-        // Set the speed
-        self.send_command(&[CMD_SET_SPEED, self.speed as u8])
-            .inspect_err(|_| self.stream = None)
-            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))?;
-        let response = self
-            .read_response(1)
-            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))?;
-        if response[0] != OK {
-            self.stream = None;
-            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                AirfrogError::ApiError("Failed to set speed".to_string()),
-            ))));
-        }
-
-        Ok(())
+        // Set the speed, to the default, in case the airfrog was otherwise
+        // configured
+        self.set_speed_airfrog(self.speed)
+            .map(|_| self.stream = None)
     }
 
     // Doesn't seem to be called by probe-rs when using Ctrl-C to exit probe-rs.
@@ -346,20 +399,7 @@ impl DebugProbe for AirfrogProbe {
     }
 
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
-        self.send_command(&[CMD_RESET_TARGET])
-            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))?;
-
-        let response = self
-            .read_response(1)
-            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))?;
-
-        if response[0] != OK {
-            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                AirfrogError::ApiError("Reset failed".to_string()),
-            ))));
-        }
-
-        Ok(())
+        self.send_recv_airfrog(&[CMD_RESET_TARGET])
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
@@ -417,20 +457,10 @@ impl RawDapAccess for AirfrogProbe {
         };
 
         // Send it
-        self.send_command(&[cmd, reg]).map_err(Self::to_arm_error)?;
-
-        // Read response: [status][data:4]
-        let response = self.read_response(5).map_err(Self::to_arm_error)?;
-
-        if response[0] != OK {
-            return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                "Register read failed, status: {:#04X}",
-                response[0]
-            ))));
-        }
+        let response = self.send_recv_read_airfrog(&[cmd, reg], 4)?.unwrap();
 
         // Received OK, convert to u32 and return
-        let value = u32::from_le_bytes([response[1], response[2], response[3], response[4]]);
+        let value = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
         Ok(value)
     }
 
@@ -444,24 +474,12 @@ impl RawDapAccess for AirfrogProbe {
             RegisterAddress::ApRegister(_) => (CMD_AP_WRITE, address.lsb()),
         };
 
-        // Add the word on the end
+        // Add the data word on the end
         let mut command = vec![cmd, reg];
         command.extend_from_slice(&value.to_le_bytes());
 
         // Send it
-        self.send_command(&command).map_err(Self::to_arm_error)?;
-
-        // Read response: [status]
-        let response = self.read_response(1).map_err(Self::to_arm_error)?;
-
-        if response[0] != OK {
-            return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                "Register write failed, status: {:#04X}",
-                response[0]
-            ))));
-        }
-
-        // Success
+        self.send_recv_airfrog(&command)?;
         Ok(())
     }
 
@@ -493,23 +511,13 @@ impl RawDapAccess for AirfrogProbe {
                 let mut command = vec![CMD_AP_BULK_READ, reg];
                 command.extend_from_slice(&count.to_le_bytes());
 
-                // Send it
-                self.send_command(&command).map_err(Self::to_arm_error)?;
+                // Send it and read response: ([status])[count:2][data...]
+                let response = self.send_recv_read_airfrog(
+                    &command,
+                    2 + (values.len() * 4),
+                )?.unwrap();
 
-                // Read response: [status][count:2][data...]
-                let response_len = 3 + (values.len() * 4);
-                let response = self
-                    .read_response(response_len)
-                    .map_err(Self::to_arm_error)?;
-
-                if response[0] != OK {
-                    return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                        "Bulk read failed, status: {:#04X}",
-                        response[0]
-                    ))));
-                }
-
-                let returned_count = u16::from_le_bytes([response[1], response[2]]) as usize;
+                let returned_count = u16::from_le_bytes([response[0], response[1]]) as usize;
                 if returned_count != values.len() {
                     return Err(ArmError::Probe(DebugProbeError::Other(format!(
                         "Count mismatch: expected {}, got {}",
@@ -520,7 +528,7 @@ impl RawDapAccess for AirfrogProbe {
 
                 // Extract data and store in provided buffer
                 for (i, val) in values.iter_mut().enumerate() {
-                    let offset = 3 + (i * 4);
+                    let offset = 2 + (i * 4);
                     *val = u32::from_le_bytes([
                         response[offset],
                         response[offset + 1],
@@ -553,7 +561,8 @@ impl RawDapAccess for AirfrogProbe {
             }
             RegisterAddress::ApRegister(_) => {
                 // Queue up AP writes - they will be sent when `raw_flush()` is
-                // called.
+                // called, which will also be if another type of register
+                // operation (individual write, any sort of read) is executed
                 let block = WriteBlock {
                     address,
                     data: values.to_vec(),
