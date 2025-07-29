@@ -134,7 +134,7 @@ impl AirfrogProbe {
     fn to_arm_error(e: AirfrogError) -> ArmError {
         ArmError::Probe(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))
     }
-    
+
     fn internal_write_ap_block(&mut self, block: WriteBlock) -> Result<(), ArmError> {
         let address = block.address;
         let values = block.data;
@@ -297,22 +297,28 @@ impl DebugProbe for AirfrogProbe {
         stream.read_exact(&mut version_buf).map_err(|e| {
             DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(AirfrogError::Io(e))))
         })?;
-        if version_buf[0] != API_VERSION {
-            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                AirfrogError::ApiError("Version mismatch".to_string()),
-            ))));
-        }
 
         // Then send version
         stream.write_all(&[API_VERSION]).map_err(|e| {
             DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(AirfrogError::Io(e))))
         })?;
 
-        // Reset target using binary protocol
-        self.target_reset()?;
-
-        // All good
+        // All good so far
         self.stream = Some(stream);
+
+        // Set the speed
+        self.send_command(&[CMD_SET_SPEED, self.speed as u8])
+            .inspect_err(|_| self.stream = None)
+            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))?;
+        let response = self
+            .read_response(1)
+            .map_err(|e| DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))))?;
+        if response[0] != OK {
+            self.stream = None;
+            return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
+                AirfrogError::ApiError("Failed to set speed".to_string()),
+            ))));
+        }
 
         Ok(())
     }
