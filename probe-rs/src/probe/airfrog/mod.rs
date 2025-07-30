@@ -18,9 +18,8 @@ use crate::{
     },
 };
 use airfrog_bin::{
-    API_MAX_WORD_COUNT, API_PORT, API_VERSION, CMD_AP_BULK_READ, CMD_AP_BULK_WRITE, CMD_AP_READ,
-    CMD_AP_WRITE, CMD_DISCONNECT, CMD_DP_READ, CMD_DP_WRITE, CMD_RESET_TARGET, CMD_SET_SPEED, OK,
-    Speed,
+    CMD_AP_BULK_READ, CMD_AP_BULK_WRITE, CMD_AP_READ, CMD_AP_WRITE, CMD_DISCONNECT, CMD_DP_READ,
+    CMD_DP_WRITE, CMD_RESET_TARGET, CMD_SET_SPEED, MAX_WORD_COUNT, PORT, RSP_OK, Speed, VERSION,
 };
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -97,7 +96,7 @@ impl AirfrogProbe {
             (h.to_string(), port)
         } else {
             // Default port if not specified
-            (address, API_PORT)
+            (address, PORT)
         };
 
         Ok(Self {
@@ -131,14 +130,14 @@ impl AirfrogProbe {
     fn send_recv_read_airfrog(
         &mut self,
         send_data: &[u8],
-        expected_len: usize
+        expected_len: usize,
     ) -> Result<Option<Vec<u8>>, DebugProbeError> {
         // Send th command
         self.send_command(send_data)?;
 
         // Receive the response
-        let result = self.read_response(expected_len+1);
-        
+        let result = self.read_response(expected_len + 1);
+
         // Process all possible error cases
 
         let response = if let Err(e) = result {
@@ -151,9 +150,12 @@ impl AirfrogProbe {
             return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
                 AirfrogError::InvalidResponse("Empty response from probe".to_string()),
             ))));
-        } else if response[0] != OK {
+        } else if response[0] != RSP_OK {
             return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                AirfrogError::ApiError(format!("Probe command failed with status: {:#04X}", response[0])),
+                AirfrogError::ApiError(format!(
+                    "Probe command failed with status: {:#04X}",
+                    response[0]
+                )),
             ))));
         } else if response.len() != expected_len + 1 {
             return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
@@ -172,7 +174,9 @@ impl AirfrogProbe {
                 // explicitly check it as we guarantee that if `expected_len` is
                 // non-zero, we will return Some(data).
                 Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                    AirfrogError::InvalidResponse("Internal probe-rs drive error - please raise an issue".to_string()),
+                    AirfrogError::InvalidResponse(
+                        "Internal probe-rs drive error - please raise an issue".to_string(),
+                    ),
                 ))))
             } else {
                 Ok(None)
@@ -184,11 +188,10 @@ impl AirfrogProbe {
 
     // Single function to send a command and expect only the status byte back.
     fn send_recv_airfrog(&mut self, send_data: &[u8]) -> Result<(), DebugProbeError> {
-        self.send_recv_read_airfrog(send_data, 0)
-            .map(|_| ())
+        self.send_recv_read_airfrog(send_data, 0).map(|_| ())
     }
 
-    // Sends a binary API command command over TCP to the Airfrog probe. 
+    // Sends a binary API command command over TCP to the Airfrog probe.
     fn send_command(&mut self, data: &[u8]) -> Result<(), AirfrogError> {
         let stream = self
             .stream
@@ -223,7 +226,7 @@ impl AirfrogProbe {
 
     // Write a block of data to a single AP register.  This sends makes a
     // single binary API call to send all of the data, up to
-    // API_MAX_WORD_COUNT 
+    // MAX_WORD_COUNT
     fn internal_write_ap_block(&mut self, block: WriteBlock) -> Result<(), ArmError> {
         let address = block.address;
         let values = block.data;
@@ -232,9 +235,9 @@ impl AirfrogProbe {
             RegisterAddress::DpRegister(_) => unreachable!("DP blocks not supported"),
             RegisterAddress::ApRegister(_) => {
                 let count = values.len();
-                if count > API_MAX_WORD_COUNT {
+                if count > MAX_WORD_COUNT as usize {
                     return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                        "Bulk write limit exceeded - {API_MAX_WORD_COUNT} words vs {count}"
+                        "Bulk write limit exceeded - {MAX_WORD_COUNT} words vs {count}"
                     ))));
                 }
 
@@ -324,8 +327,7 @@ impl DebugProbe for AirfrogProbe {
 
     fn set_speed(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
         let speed = Speed::from_khz(speed_khz);
-        self.set_speed_airfrog(speed)
-            .map(|_| self.speed.to_khz())
+        self.set_speed_airfrog(speed).map(|_| self.speed.to_khz())
     }
 
     fn attach(&mut self) -> Result<(), DebugProbeError> {
@@ -361,7 +363,7 @@ impl DebugProbe for AirfrogProbe {
         })?;
 
         // Then send version
-        stream.write_all(&[API_VERSION]).map_err(|e| {
+        stream.write_all(&[VERSION]).map_err(|e| {
             DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(AirfrogError::Io(e))))
         })?;
 
@@ -512,10 +514,9 @@ impl RawDapAccess for AirfrogProbe {
                 command.extend_from_slice(&count.to_le_bytes());
 
                 // Send it and read response: ([status])[count:2][data...]
-                let response = self.send_recv_read_airfrog(
-                    &command,
-                    2 + (values.len() * 4),
-                )?.unwrap();
+                let response = self
+                    .send_recv_read_airfrog(&command, 2 + (values.len() * 4))?
+                    .unwrap();
 
                 let returned_count = u16::from_le_bytes([response[0], response[1]]) as usize;
                 if returned_count != values.len() {
@@ -596,7 +597,7 @@ impl RawDapAccess for AirfrogProbe {
                 .collect();
 
             // Send in chunks of max size
-            for chunk in combined_data.chunks(API_MAX_WORD_COUNT) {
+            for chunk in combined_data.chunks(MAX_WORD_COUNT as usize) {
                 let chunk_block = WriteBlock {
                     address: first_addr,
                     data: chunk.to_vec(),
