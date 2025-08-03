@@ -68,20 +68,28 @@ pub struct AirfrogProbe {
 #[derive(thiserror::Error, Debug)]
 pub enum AirfrogError {
     /// IO error  
-    #[error("IO error: {0}")]
+    #[error("Airfrog probe communication failed: {0}")]
     Io(#[from] std::io::Error),
 
     /// Invalid response from airfrog
-    #[error("Invalid response: {0}")]
+    #[error("Airfrog probe returned invalid response: {0}")]
     InvalidResponse(String),
 
-    /// Airfrog API error
-    #[error("Airfrog API error: {0}")]
-    ApiError(String),
+    /// Airfrog command failed
+    #[error("Airfrog probe command failed: {0}")]
+    CommandFailed(String),
+
+    /// Not attached to an Airfrog probe
+    #[error("Not attached to Airfrog probe")]
+    NotAttached,
 
     /// Invalid URL
-    #[error("Invalid IP/port: {0}")]
+    #[error("Invalid Airfrog IP/port: {0}")]
     InvalidUrl(String),
+
+    /// Internal Error
+    #[error("Airfrog driver internal error - please raise an issue: {0}")]
+    InternalError(String),
 }
 
 impl ProbeError for AirfrogError {}
@@ -92,7 +100,7 @@ impl AirfrogProbe {
         let (host, port) = if let Some((h, p)) = address.split_once(':') {
             let port = p
                 .parse::<u16>()
-                .map_err(|_| AirfrogError::InvalidUrl(format!("Invalid port: {p}")))?;
+                .map_err(|_| AirfrogError::InvalidUrl(format!("Port: {p}")))?;
             (h.to_string(), port)
         } else {
             // Default port if not specified
@@ -112,21 +120,22 @@ impl AirfrogProbe {
 // Binary protocol helpers
 impl AirfrogProbe {
     // Single function that sends a command, waits for the response, and
-    // checks it was successful.  It handles errors in a command way, allowing
-    // the probe-rs traits to be as simple as possible.
+    // checks it was successful.  It handles errors in a common way, allowing
+    // the Airfrog probe-rs trait implementations to be as simple as possible.
     //
     // Arguments:
     // - send_data: Data to send - a command and, for writes, the data to write
-    // - expected_len: Expected length of the response, not including the
-    //   first, status, byte
+    // - expected_len: Expected length of the response, in addition to the
+    //   first, status, byte.
     //
     // Returns:
     // - Ok(None) if the command was successful and no data is expected back
     // - Ok(Some(data)) if the command was successful and data is expected
     // - Err(DebugProbeError) if there was an error in sending the command,
     //
-    // If a non zero value was passed in `expected_len`, the response is
-    // guaranteed to be Some(), to allow the caller to unwrap.
+    // If a non zero value was passed in `expected_len`, a success response is
+    // guaranteed to be Ok(Some(data)), not None, to allow the caller to
+    // unwrap safely.
     fn send_recv_read_airfrog(
         &mut self,
         send_data: &[u8],
@@ -150,7 +159,7 @@ impl AirfrogProbe {
             ))));
         } else if response[0] != RSP_OK {
             return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                AirfrogError::ApiError(format!(
+                AirfrogError::CommandFailed(format!(
                     "Probe command failed with status: {:#04X}",
                     response[0]
                 )),
@@ -169,11 +178,11 @@ impl AirfrogProbe {
         if response.len() == 1 {
             if expected_len > 0 {
                 // This can only happen if our above logic was flawed, but we
-                // explicitly check it as we guarantee that if `expected_len` is
-                // non-zero, we will return Some(data).
+                // explicitly check it as we guarantee that if `expected_len`
+                // is non-zero, we will return Some(data).
                 Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
-                    AirfrogError::InvalidResponse(
-                        "Internal probe-rs drive error - please raise an issue".to_string(),
+                    AirfrogError::InternalError(
+                        "Expected non-zero response length, but got 0".to_string(),
                     ),
                 ))))
             } else {
@@ -185,6 +194,8 @@ impl AirfrogProbe {
     }
 
     // Single function to send a command and expect only the status byte back.
+    //
+    // A simplified version of `send_recv_read_airfrog()`.
     fn send_recv_airfrog(&mut self, send_data: &[u8]) -> Result<(), DebugProbeError> {
         self.send_recv_read_airfrog(send_data, 0).map(|_| ())
     }
@@ -194,7 +205,7 @@ impl AirfrogProbe {
         let stream = self
             .stream
             .as_mut()
-            .ok_or_else(|| AirfrogError::ApiError("Not connected".to_string()))?;
+            .ok_or(AirfrogError::NotAttached)?;
         stream.write_all(data)?;
         Ok(())
     }
@@ -205,7 +216,7 @@ impl AirfrogProbe {
         let stream = self
             .stream
             .as_mut()
-            .ok_or_else(|| AirfrogError::ApiError("Not connected".to_string()))?;
+            .ok_or(AirfrogError::NotAttached)?;
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf)?;
         Ok(buf)
@@ -230,12 +241,14 @@ impl AirfrogProbe {
         let values = block.data;
 
         match address {
-            RegisterAddress::DpRegister(_) => unreachable!("DP blocks not supported"),
+            RegisterAddress::DpRegister(_) => {
+                unreachable!("DP blocks not supported by internal_write_ap_block")
+            }
             RegisterAddress::ApRegister(_) => {
                 let count = values.len();
                 if count > MAX_WORD_COUNT as usize {
                     return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                        "Bulk write limit exceeded - {MAX_WORD_COUNT} words vs {count}"
+                        "Airfrog API bulk write limit exceeded - {MAX_WORD_COUNT} words vs {count}"
                     ))));
                 }
 
