@@ -19,7 +19,8 @@ use crate::{
 };
 use airfrog_bin::{
     CMD_AP_BULK_READ, CMD_AP_BULK_WRITE, CMD_AP_READ, CMD_AP_WRITE, CMD_DISCONNECT, CMD_DP_READ,
-    CMD_DP_WRITE, CMD_RESET_TARGET, CMD_SET_SPEED, MAX_WORD_COUNT, PORT, RSP_OK, Speed, VERSION,
+    CMD_DP_WRITE, CMD_MULTI_REG_WRITE, CMD_RESET_TARGET, CMD_SET_SPEED, MAX_WORD_COUNT, PORT,
+    RSP_OK, RegType, Speed, VERSION,
 };
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -36,11 +37,23 @@ impl std::fmt::Display for AirfrogFactory {
     }
 }
 
+// Struct to hold cached up single register writes, in order to batch them up
+// before sending
+#[derive(Debug)]
+struct WriteReg {
+    /// Address to write to
+    address: RegisterAddress,
+
+    /// Data to write
+    data: u32,
+}
+
 // Struct to hold AP write blocks, in order to batch them up before sending
 #[derive(Debug)]
 struct WriteBlock {
     /// Address to write to
     address: RegisterAddress,
+
     /// Data to write
     data: Vec<u32>,
 }
@@ -59,6 +72,9 @@ pub struct AirfrogProbe {
 
     /// TCP stream for binary protocol
     stream: Option<std::net::TcpStream>,
+
+    // Queued up single write operations to be sent
+    write_regs: Vec<WriteReg>,
 
     // Queued up AP write blocks to be sent
     ap_write_blocks: Vec<WriteBlock>,
@@ -112,6 +128,7 @@ impl AirfrogProbe {
             port,
             speed: Speed::default(),
             stream: None,
+            write_regs: Vec::new(),
             ap_write_blocks: Vec::new(),
         })
     }
@@ -202,10 +219,7 @@ impl AirfrogProbe {
 
     // Sends a binary API command command over TCP to the Airfrog probe.
     fn send_command(&mut self, data: &[u8]) -> Result<(), AirfrogError> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or(AirfrogError::NotAttached)?;
+        let stream = self.stream.as_mut().ok_or(AirfrogError::NotAttached)?;
         stream.write_all(data)?;
         Ok(())
     }
@@ -213,10 +227,7 @@ impl AirfrogProbe {
     // Reads a response from the Airfrog probe.  Blocks until the expected
     // number of bytes have been read.
     fn read_response(&mut self, len: usize) -> Result<Vec<u8>, AirfrogError> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or(AirfrogError::NotAttached)?;
+        let stream = self.stream.as_mut().ok_or(AirfrogError::NotAttached)?;
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf)?;
         Ok(buf)
@@ -239,6 +250,11 @@ impl AirfrogProbe {
     fn internal_write_ap_block(&mut self, block: WriteBlock) -> Result<(), ArmError> {
         let address = block.address;
         let values = block.data;
+
+        println!(
+            "Sending AP block writes to {address:?} with {} words",
+            values.len()
+        );
 
         match address {
             RegisterAddress::DpRegister(_) => {
@@ -266,6 +282,92 @@ impl AirfrogProbe {
                 Ok(())
             }
         }
+    }
+
+    // Called by raw_flush() to flush any queued up AP write blocks.
+    fn flush_write_blocks(&mut self) -> Result<(), ArmError> {
+        // Get all the blocks to write
+        let write_blocks: Vec<_> = self.ap_write_blocks.drain(..).collect();
+
+        if write_blocks.is_empty() {
+            return Ok(());
+        }
+
+        // See if they are all for the same register address - if so, we can
+        // combine them into a single bulk write.  Even if a few sequential
+        // ones were the same and the others weren't we could, but we won't
+        // bother as it's unlikely.
+        let first_addr = write_blocks[0].address;
+        let all_same_addr = write_blocks.iter().all(|block| block.address == first_addr);
+
+        if all_same_addr {
+            // Create a single write
+            let combined_data: Vec<u32> = write_blocks
+                .into_iter()
+                .flat_map(|block| block.data)
+                .collect();
+
+            // Send in chunks of max size
+            for chunk in combined_data.chunks(MAX_WORD_COUNT as usize) {
+                let chunk_block = WriteBlock {
+                    address: first_addr,
+                    data: chunk.to_vec(),
+                };
+                self.internal_write_ap_block(chunk_block)?;
+            }
+        } else {
+            // Fall back to individual writes of blocks
+            for block in write_blocks {
+                self.internal_write_ap_block(block)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flush_write_reg(&mut self) -> Result<(), ArmError> {
+        // Get all the single writes to do
+        let write_regs: Vec<_> = self.write_regs.drain(..).collect();
+
+        if write_regs.is_empty() {
+            return Ok(());
+        } else if write_regs.len() == 1 {
+            // If there's only one, we can just write it directly
+            println!("Sending 1 multi-reg write");
+            let (cmd, reg) = match write_regs[0].address {
+                RegisterAddress::DpRegister(_) => (CMD_DP_WRITE, write_regs[0].address.lsb()),
+                RegisterAddress::ApRegister(_) => (CMD_AP_WRITE, write_regs[0].address.lsb()),
+            };
+            let mut command = vec![cmd, reg];
+            command.extend_from_slice(&write_regs[0].data.to_le_bytes());
+            self.send_recv_airfrog(&command)?;
+            return Ok(());
+        }
+
+        // More than one write - build the MultiRegWrite command
+        println!("Sending {} multi-reg writes", write_regs.len());
+        let mut command = Vec::with_capacity(1 + 2 + (6 * write_regs.len()));
+        command.push(CMD_MULTI_REG_WRITE);
+        command.extend_from_slice(&(write_regs.len() as u16).to_le_bytes());
+
+        for reg in &write_regs {
+            // Add the command byte
+            let cmd = match reg.address {
+                RegisterAddress::DpRegister(_) => RegType::Dp as u8,
+                RegisterAddress::ApRegister(_) => RegType::Ap as u8,
+            };
+            command.push(cmd);
+
+            // Add the register address
+            command.push(reg.address.lsb());
+
+            // Add the data
+            command.extend_from_slice(&reg.data.to_le_bytes());
+        }
+
+        self.send_recv_airfrog(&command)?;
+
+        Ok(())
     }
 }
 
@@ -478,21 +580,15 @@ impl RawDapAccess for AirfrogProbe {
     }
 
     fn raw_write_register(&mut self, address: RegisterAddress, value: u32) -> Result<(), ArmError> {
-        // Flush any other pending operations first
-        self.raw_flush()?;
+        // Flush any other pending write block operations first
+        self.flush_write_blocks()?;
 
-        // Encode the command: [cmd][reg]
-        let (cmd, reg) = match address {
-            RegisterAddress::DpRegister(_) => (CMD_DP_WRITE, address.lsb()),
-            RegisterAddress::ApRegister(_) => (CMD_AP_WRITE, address.lsb()),
+        let write_reg = WriteReg {
+            address,
+            data: value,
         };
+        self.write_regs.push(write_reg);
 
-        // Add the data word on the end
-        let mut command = vec![cmd, reg];
-        command.extend_from_slice(&value.to_le_bytes());
-
-        // Send it
-        self.send_recv_airfrog(&command)?;
         Ok(())
     }
 
@@ -560,10 +656,13 @@ impl RawDapAccess for AirfrogProbe {
         address: RegisterAddress,
         values: &[u32],
     ) -> Result<(), ArmError> {
+        // Flush any single register writes first
+        self.flush_write_reg()?;
+
         match address {
             RegisterAddress::DpRegister(_) => {
                 // Flush any other pending operations first
-                self.raw_flush()?;
+                self.flush_write_blocks()?;
 
                 // There's no bulk DP write API as there's little use.  Use
                 // individual writes instead
@@ -586,43 +685,8 @@ impl RawDapAccess for AirfrogProbe {
     }
 
     fn raw_flush(&mut self) -> Result<(), ArmError> {
-        // Get all the blocks to write
-        let write_blocks: Vec<_> = self.ap_write_blocks.drain(..).collect();
-
-        if write_blocks.is_empty() {
-            return Ok(());
-        }
-
-        // See if they are all for the same register address - if so, we can
-        // combine them into a single bulk write.  Even if a few sequential
-        // ones were the same and the others weren't we could, but we won't
-        // bother as it's unlikely.
-        let first_addr = write_blocks[0].address;
-        let all_same_addr = write_blocks.iter().all(|block| block.address == first_addr);
-
-        if all_same_addr {
-            // Create a single write
-            let combined_data: Vec<u32> = write_blocks
-                .into_iter()
-                .flat_map(|block| block.data)
-                .collect();
-
-            // Send in chunks of max size
-            for chunk in combined_data.chunks(MAX_WORD_COUNT as usize) {
-                let chunk_block = WriteBlock {
-                    address: first_addr,
-                    data: chunk.to_vec(),
-                };
-                self.internal_write_ap_block(chunk_block)?;
-            }
-        } else {
-            // Fall back to individual writes of blocks
-            for block in write_blocks {
-                self.internal_write_ap_block(block)?;
-            }
-        }
-
-        Ok(())
+        self.flush_write_reg()?;
+        self.flush_write_blocks()
     }
 
     fn configure_jtag(&mut self, _skip_scan: bool) -> Result<(), DebugProbeError> {
