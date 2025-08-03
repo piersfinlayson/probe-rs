@@ -251,11 +251,6 @@ impl AirfrogProbe {
         let address = block.address;
         let values = block.data;
 
-        println!(
-            "Sending AP block writes to {address:?} with {} words",
-            values.len()
-        );
-
         match address {
             RegisterAddress::DpRegister(_) => {
                 unreachable!("DP blocks not supported by internal_write_ap_block")
@@ -333,7 +328,6 @@ impl AirfrogProbe {
             return Ok(());
         } else if write_regs.len() == 1 {
             // If there's only one, we can just write it directly
-            println!("Sending 1 multi-reg write");
             let (cmd, reg) = match write_regs[0].address {
                 RegisterAddress::DpRegister(_) => (CMD_DP_WRITE, write_regs[0].address.lsb()),
                 RegisterAddress::ApRegister(_) => (CMD_AP_WRITE, write_regs[0].address.lsb()),
@@ -345,7 +339,6 @@ impl AirfrogProbe {
         }
 
         // More than one write - build the MultiRegWrite command
-        println!("Sending {} multi-reg writes", write_regs.len());
         let mut command = Vec::with_capacity(1 + 2 + (6 * write_regs.len()));
         command.push(CMD_MULTI_REG_WRITE);
         command.extend_from_slice(&(write_regs.len() as u16).to_le_bytes());
