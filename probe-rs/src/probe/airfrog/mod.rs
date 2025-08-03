@@ -139,13 +139,11 @@ impl AirfrogProbe {
         let result = self.read_response(expected_len + 1);
 
         // Process all possible error cases
-
         let response = if let Err(e) = result {
             return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(e))));
         } else {
             result.unwrap()
         };
-
         if response.is_empty() {
             return Err(DebugProbeError::ProbeSpecific(BoxedProbeError(Box::new(
                 AirfrogError::InvalidResponse("Empty response from probe".to_string()),
