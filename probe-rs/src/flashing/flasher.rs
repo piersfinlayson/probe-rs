@@ -80,11 +80,10 @@ impl FlashData {
             encoder,
             ignore_fills: was_ignore_fills,
         } = self
+            && *was_ignore_fills != ignore_fills
         {
-            if *was_ignore_fills != ignore_fills {
-                // Fill handling changed, invalidate the encoder
-                *self = FlashData::Raw(encoder.flash_layout().clone());
-            }
+            // Fill handling changed, invalidate the encoder
+            *self = FlashData::Raw(encoder.flash_layout().clone());
         }
         if let FlashData::Raw(layout) = self {
             let layout = std::mem::take(layout);
@@ -236,7 +235,7 @@ impl Flasher {
     pub(super) fn init<'s, 'p, O: Operation>(
         &'s mut self,
         session: &'s mut Session,
-        progress: &'s FlashProgress<'p>,
+        progress: &'s mut FlashProgress<'p>,
         clock: Option<u32>,
     ) -> Result<(ActiveFlasher<'s, 'p, O>, &'s mut [LoadedRegion]), FlashError> {
         self.ensure_loaded(session)?;
@@ -264,7 +263,7 @@ impl Flasher {
     pub(super) fn run_erase_all(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
     ) -> Result<(), FlashError> {
         progress.started_erasing();
         let result = if session.has_sequence_erase_all() {
@@ -291,7 +290,7 @@ impl Flasher {
     pub(super) fn run_blank_check<'p, T, F>(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress<'p>,
+        progress: &mut FlashProgress<'p>,
         f: F,
     ) -> Result<T, FlashError>
     where
@@ -306,7 +305,7 @@ impl Flasher {
     pub(super) fn run_erase<'p, T, F>(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress<'p>,
+        progress: &mut FlashProgress<'p>,
         f: F,
     ) -> Result<T, FlashError>
     where
@@ -321,7 +320,7 @@ impl Flasher {
     pub(super) fn run_program<'p, T, F>(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress<'p>,
+        progress: &mut FlashProgress<'p>,
         f: F,
     ) -> Result<T, FlashError>
     where
@@ -339,7 +338,7 @@ impl Flasher {
     pub(super) fn run_verify<'p, T, F>(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress<'p>,
+        progress: &mut FlashProgress<'p>,
         f: F,
     ) -> Result<T, FlashError>
     where
@@ -363,7 +362,7 @@ impl Flasher {
     pub(super) fn program(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
         restore_unwritten_bytes: bool,
         enable_double_buffering: bool,
         skip_erasing: bool,
@@ -405,13 +404,13 @@ impl Flasher {
     pub(super) fn fill_unwritten(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
     ) -> Result<(), FlashError> {
         progress.started_filling();
 
         fn fill_pages(
             regions: &mut [LoadedRegion],
-            progress: &FlashProgress,
+            progress: &mut FlashProgress<'_>,
             mut read: impl FnMut(u64, &mut [u8]) -> Result<(), FlashError>,
         ) -> Result<(), FlashError> {
             for region in regions.iter_mut() {
@@ -433,7 +432,7 @@ impl Flasher {
         }
 
         let result = if self.flash_algorithm.pc_read.is_some() {
-            self.run_verify(session, progress, |active, data| {
+            self.run_verify(session, &mut FlashProgress::empty(), |active, data| {
                 fill_pages(data, progress, |address, data| {
                     active.read_flash(address, data)
                 })
@@ -459,7 +458,7 @@ impl Flasher {
     pub(super) fn verify(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
         ignore_filled: bool,
     ) -> Result<bool, FlashError> {
         progress.started_verifying();
@@ -477,7 +476,7 @@ impl Flasher {
     fn do_verify(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
         ignore_filled: bool,
     ) -> Result<bool, FlashError> {
         let encoding = self.flash_algorithm.transfer_encoding;
@@ -528,7 +527,9 @@ impl Flasher {
                             return Ok(false);
                         }
 
-                        progress.page_verified(bytes.len() as u64, start.elapsed());
+                        active
+                            .progress
+                            .page_verified(bytes.len() as u64, start.elapsed());
                     }
                 }
                 Ok(true)
@@ -538,7 +539,7 @@ impl Flasher {
 
             fn compare_flash(
                 regions: &[LoadedRegion],
-                progress: &FlashProgress,
+                progress: &mut FlashProgress<'_>,
                 ignore_filled: bool,
                 mut read: impl FnMut(u64, &mut [u8]) -> Result<(), FlashError>,
             ) -> Result<bool, FlashError> {
@@ -584,7 +585,7 @@ impl Flasher {
             }
 
             if self.flash_algorithm.pc_read.is_some() {
-                self.run_verify(session, progress, |active, data| {
+                self.run_verify(session, &mut FlashProgress::empty(), |active, data| {
                     compare_flash(data, progress, ignore_filled, |address, data| {
                         active.read_flash(address, data)
                     })
@@ -604,7 +605,7 @@ impl Flasher {
     fn sector_erase(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
     ) -> Result<(), FlashError> {
         progress.started_erasing();
 
@@ -635,7 +636,7 @@ impl Flasher {
     fn do_program(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
         enable_double_buffering: bool,
     ) -> Result<(), FlashError> {
         progress.started_programming();
@@ -657,7 +658,7 @@ impl Flasher {
     fn program_simple(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
     ) -> Result<(), FlashError> {
         let encoding = self.flash_algorithm.transfer_encoding;
         self.run_program(session, progress, |active, data| {
@@ -693,7 +694,7 @@ impl Flasher {
     fn program_double_buffer(
         &mut self,
         session: &mut Session,
-        progress: &FlashProgress,
+        progress: &mut FlashProgress<'_>,
     ) -> Result<(), FlashError> {
         let encoding = self.flash_algorithm.transfer_encoding;
         self.run_program(session, progress, |active, data| {
@@ -717,7 +718,9 @@ impl Flasher {
                     active.wait_for_write_end(last_page_address)?;
 
                     last_page_address = page.address();
-                    progress.page_programmed(page.size() as u64, t.elapsed());
+                    active
+                        .progress
+                        .page_programmed(page.size() as u64, t.elapsed());
 
                     t = Instant::now();
 
@@ -791,7 +794,7 @@ pub(super) struct ActiveFlasher<'op, 'p, O: Operation> {
     core: Core<'op>,
     instruction_set: InstructionSet,
     rtt: Option<Rtt>,
-    progress: &'op FlashProgress<'p>,
+    progress: &'op mut FlashProgress<'p>,
     flash_algorithm: &'op FlashAlgorithm,
     _operation: PhantomData<O>,
 }

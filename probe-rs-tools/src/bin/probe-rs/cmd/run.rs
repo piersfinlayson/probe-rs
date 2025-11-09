@@ -5,7 +5,7 @@ use crate::rpc::functions::monitor::{MonitorMode, MonitorOptions};
 use crate::rpc::functions::test::{Test, TestDefinition};
 
 use crate::FormatOptions;
-use crate::util::cli::{self, connect_target_output_files, rtt_client};
+use crate::util::cli::{self, connect_target_output_files, parse_semihosting_options, rtt_client};
 use crate::util::common_options::{BinaryDownloadOptions, ProbeOptions};
 
 use anyhow::{Context, anyhow};
@@ -145,13 +145,13 @@ pub struct SharedOptions {
     #[clap(long)]
     pub(crate) always_print_stacktrace: bool,
 
-    /// Whether to erase the entire chip before downloading
-    #[clap(long, help_heading = "DOWNLOAD CONFIGURATION")]
-    pub(crate) chip_erase: bool,
-
     /// Suppress filename and line number information from the rtt log
     #[clap(long)]
     pub(crate) no_location: bool,
+
+    /// Suppress timestamps from the rtt log
+    #[clap(long)]
+    pub(crate) no_timestamps: bool,
 
     #[clap(flatten)]
     pub(crate) format_options: FormatOptions,
@@ -174,6 +174,16 @@ pub struct SharedOptions {
     /// Scan the memory to find the RTT control block
     #[clap(long)]
     pub(crate) rtt_scan_memory: bool,
+
+    /// File name to expose via semihosting. Values ending with a slash expose the whole directory.
+    /// By using `target=host` arguments the names can differ between the host and the target.
+    /// TCP and UNIX domain socket connections are possible by exposing files of the form
+    /// `tcp:hostname:port` or `unix:/some/path`. `file:/some/path` is valid for files too.
+    /// If the target path starts with a `^` and ends with a `$` it's interpreted as a regular
+    /// expression and captures are expanded in the host path (e.g. `--semihosting-file
+    /// "^/(\d).(\d)$=/path$1/file$2.txt"`).
+    #[arg(long, help_heading = "SEMIHOSTING CONFIGURATION")]
+    pub semihosting_file: Vec<String>,
 }
 
 impl Cmd {
@@ -193,6 +203,7 @@ impl Cmd {
                 false => crate::rpc::functions::rtt_client::ScanRegion::Ranges(vec![]),
             },
             self.shared_options.log_format,
+            !self.shared_options.no_timestamps,
             !self.shared_options.no_location,
             Some(utc_offset),
         )
@@ -201,13 +212,15 @@ impl Cmd {
         let mut target_output_files =
             connect_target_output_files(self.shared_options.target_output_file).await?;
 
+        let semihosting_options = parse_semihosting_options(self.shared_options.semihosting_file)?;
+
         let client_handle = rtt_client.handle();
 
         // Flash firmware
         let boot_info = cli::flash(
             &session,
             &self.shared_options.path,
-            self.shared_options.chip_erase,
+            self.shared_options.download_options.chip_erase,
             self.shared_options.format_options,
             self.shared_options.download_options,
             Some(&mut rtt_client),
@@ -240,6 +253,7 @@ impl Cmd {
                 &self.shared_options.path,
                 Some(rtt_client),
                 &mut target_output_files,
+                semihosting_options,
             )
             .await
         } else {
@@ -252,6 +266,7 @@ impl Cmd {
                     catch_reset: !self.run_options.no_catch_reset,
                     catch_hardfault: !self.run_options.no_catch_hardfault,
                     rtt_client: Some(client_handle),
+                    semihosting_options,
                 },
                 self.shared_options.always_print_stacktrace,
                 &mut target_output_files,
@@ -340,8 +355,7 @@ impl<'a> ElfReader<'a> {
             }
 
             _ => Err(anyhow!(
-                "Found embedded_test protocol version {}, which is not yet supported by probe-rs. Update probe-rs?",
-                version
+                "Found embedded_test protocol version {version}, which is not yet supported by probe-rs. Update probe-rs?"
             )),
         }
     }
@@ -360,7 +374,7 @@ impl<'a> ElfReader<'a> {
         let sym_name = self.symbol_name_of(sym)?;
         let def: TestDefinition = serde_json::from_str(sym_name)?;
         let mut test: Test = def.into();
-        test.name = format!("{}::{}", mod_path, test.name); //prepend mod path to test name
+        test.name = format!("{mod_path}::{}", test.name); //prepend mod path to test name
         test.address = Some(test_fn_ptr);
         Ok(test)
     }
@@ -369,7 +383,7 @@ impl<'a> ElfReader<'a> {
         self.elf
             .strtab
             .get_at(sym.st_name)
-            .ok_or(anyhow!("No name for symbol {:?}", sym))
+            .ok_or(anyhow!("No name for symbol {sym:?}"))
     }
 
     #[inline]
@@ -394,8 +408,7 @@ impl<'a> ElfReader<'a> {
                     && mod_path_ptr + mod_path_len <= (section.sh_addr + section.sh_size) as u32
             })
             .ok_or(anyhow!(
-                "section not found for mod path str {:x}",
-                mod_path_ptr
+                "section not found for mod path str {mod_path_ptr:x}"
             ))?;
 
         let file_offset = self.file_offset_for(mod_path_ptr as u64, section);

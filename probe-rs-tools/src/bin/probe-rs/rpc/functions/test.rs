@@ -12,9 +12,12 @@ use crate::{
         functions::{
             ListTestsEndpoint, RpcResult, RpcSpawnContext, RunTestEndpoint, WireTxImpl,
             flash::BootInfo,
-            monitor::{MonitorSender, RttPoller, SemihostingEvent, SemihostingReader},
+            monitor::{MonitorSender, RttPoller, SemihostingEvent},
         },
-        utils::run_loop::{ReturnReason, RunLoop},
+        utils::{
+            run_loop::{ReturnReason, RunLoop},
+            semihosting::{SemihostingFileManager, SemihostingOptions},
+        },
     },
     util::rtt::client::RttClient,
 };
@@ -104,6 +107,7 @@ pub struct ListTestsRequest {
     pub boot_info: BootInfo,
     /// RTT client if used.
     pub rtt_client: Option<Key<RttClient>>,
+    pub semihosting_options: SemihostingOptions,
 }
 
 pub type ListTestsResponse = RpcResult<Tests>;
@@ -131,8 +135,9 @@ fn list_tests_impl(
     sender: MonitorSender,
 ) -> anyhow::Result<Tests> {
     let mut session = ctx.session_blocking(request.sessid);
-    let mut list_handler =
-        ListEventHandler::new(|event| sender.send_semihosting_event(event).unwrap());
+    let mut list_handler = ListEventHandler::new(request.semihosting_options, |event| {
+        sender.send_semihosting_event(event).unwrap()
+    });
 
     let mut rtt_client = request
         .rtt_client
@@ -189,6 +194,7 @@ pub struct RunTestRequest {
     pub test: Test,
     /// RTT client if used.
     pub rtt_client: Option<Key<RttClient>>,
+    pub semihosting_options: SemihostingOptions,
 }
 
 pub type RunTestResponse = RpcResult<TestResult>;
@@ -235,9 +241,10 @@ fn run_test_impl(
     }
 
     let expected_outcome = request.test.expected_outcome;
-    let mut run_handler = RunEventHandler::new(request.test, |event| {
-        sender.send_semihosting_event(event).unwrap()
-    });
+    let mut run_handler =
+        RunEventHandler::new(request.test, request.semihosting_options, |event| {
+            sender.send_semihosting_event(event).unwrap()
+        });
 
     let mut run_loop = RunLoop {
         core_id,
@@ -276,7 +283,7 @@ fn run_test_impl(
 }
 
 struct ListEventHandler<F: FnMut(SemihostingEvent)> {
-    semihosting_reader: SemihostingReader,
+    semihosting_file_manager: SemihostingFileManager,
     cmdline_requested: bool,
     sender: F,
 }
@@ -284,9 +291,9 @@ struct ListEventHandler<F: FnMut(SemihostingEvent)> {
 impl<F: FnMut(SemihostingEvent)> ListEventHandler<F> {
     const SEMIHOSTING_USER_LIST: u32 = 0x100;
 
-    fn new(sender: F) -> Self {
+    fn new(semihosting_options: SemihostingOptions, sender: F) -> Self {
         Self {
-            semihosting_reader: SemihostingReader::new(),
+            semihosting_file_manager: SemihostingFileManager::new(semihosting_options),
             cmdline_requested: false,
             sender,
         }
@@ -304,6 +311,12 @@ impl<F: FnMut(SemihostingEvent)> ListEventHandler<F> {
         // When the target first invokes SYS_GET_CMDLINE (0x15), we answer "list"
         // Then, we wait until the target invokes SEMIHOSTING_USER_LIST (0x100) with the json containing all tests
         match cmd {
+            SemihostingCommand::ExitSuccess => {
+                anyhow::bail!("Application exited instead of providing a test list")
+            }
+            SemihostingCommand::ExitError(details) => anyhow::bail!(
+                "Application exited with error {details} instead of providing a test list",
+            ),
             SemihostingCommand::GetCommandLine(request) if !self.cmdline_requested => {
                 tracing::debug!("target asked for cmdline. send 'list'");
                 self.cmdline_requested = true;
@@ -322,10 +335,13 @@ impl<F: FnMut(SemihostingEvent)> ListEventHandler<F> {
 
                 Ok(Some(list.into()))
             }
-            other if SemihostingReader::is_io(other) => {
-                if let Some((stream, data)) = self.semihosting_reader.handle(other, core)? {
-                    (self.sender)(SemihostingEvent::Output { stream, data });
-                }
+            other if SemihostingFileManager::can_handle(other) => {
+                self.semihosting_file_manager
+                    .handle(other, core, &mut self.sender)?;
+                Ok(None)
+            }
+            SemihostingCommand::Time(request) => {
+                request.write_current_time(core)?;
                 Ok(None)
             }
             SemihostingCommand::Errno(_) => Ok(None),
@@ -353,17 +369,17 @@ fn read_test_list(
 }
 
 struct RunEventHandler<F: FnMut(SemihostingEvent)> {
-    semihosting_reader: SemihostingReader,
+    semihosting_file_manager: SemihostingFileManager,
     cmdline_requested: bool,
     test: Test,
     sender: F,
 }
 
 impl<F: FnMut(SemihostingEvent)> RunEventHandler<F> {
-    fn new(test: Test, sender: F) -> Self {
+    fn new(test: Test, semihosting_options: SemihostingOptions, sender: F) -> Self {
         Self {
             test,
-            semihosting_reader: SemihostingReader::new(),
+            semihosting_file_manager: SemihostingFileManager::new(semihosting_options),
             cmdline_requested: false,
             sender,
         }
@@ -401,10 +417,13 @@ impl<F: FnMut(SemihostingEvent)> RunEventHandler<F> {
             SemihostingCommand::ExitError(_) if self.cmdline_requested => {
                 Ok(Some(TestOutcome::Panic))
             }
-            other if SemihostingReader::is_io(other) => {
-                if let Some((stream, data)) = self.semihosting_reader.handle(other, core)? {
-                    (self.sender)(SemihostingEvent::Output { stream, data });
-                }
+            other if SemihostingFileManager::can_handle(other) => {
+                self.semihosting_file_manager
+                    .handle(other, core, &mut self.sender)?;
+                Ok(None)
+            }
+            SemihostingCommand::Time(request) => {
+                request.write_current_time(core)?;
                 Ok(None)
             }
             SemihostingCommand::Errno(_) => Ok(None),
