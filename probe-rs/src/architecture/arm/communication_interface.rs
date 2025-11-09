@@ -469,9 +469,7 @@ impl ArmCommunicationInterface {
                 s.set_addr(((address >> 4) & 0xFFFF_FFFF) as u32);
                 s1.set_addr((address >> 32) as u32);
             }
-            _ => unreachable!(
-                "Did not expect to be called with {ap:x?}. This is a bug, please report it."
-            ),
+            _ => return Err(ArmError::Other("Unexpected AP version / DP version combination".to_string())),
         }
 
         if previous_select != dp_state.current_select {
