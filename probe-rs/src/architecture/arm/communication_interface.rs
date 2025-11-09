@@ -469,7 +469,11 @@ impl ArmCommunicationInterface {
                 s.set_addr(((address >> 4) & 0xFFFF_FFFF) as u32);
                 s1.set_addr((address >> 32) as u32);
             }
-            _ => return Err(ArmError::Other("Unexpected AP version / DP version combination".to_string())),
+            _ => return Err(
+                ArmError::Other(
+                    format!("Unexpected AP / DP combination {}/{}", ap.ap(), dp_state.debug_port_version)
+                )
+            ),
         }
 
         if previous_select != dp_state.current_select {
