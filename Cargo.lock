@@ -44,6 +44,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "airfrog-bin"
+version = "0.1.2"
+dependencies = [
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2916,6 +2924,7 @@ dependencies = [
 name = "probe-rs"
 version = "0.30.0"
 dependencies = [
+ "airfrog-bin",
  "anyhow",
  "async-io",
  "bincode",

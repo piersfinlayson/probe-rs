@@ -555,6 +555,8 @@ impl DebugProbe for AirfrogProbe {
 
 impl RawDapAccess for AirfrogProbe {
     fn raw_read_register(&mut self, address: RegisterAddress) -> Result<u32, ArmError> {
+        //println!("raw_read_register: {:?}", address);
+
         // Flush any other pending operations first
         self.raw_flush()?;
 
@@ -573,6 +575,8 @@ impl RawDapAccess for AirfrogProbe {
     }
 
     fn raw_write_register(&mut self, address: RegisterAddress, value: u32) -> Result<(), ArmError> {
+        //print!("raw_write_register: {:?} = {:#010X}\n", address, value);
+
         // Flush any other pending write block operations first
         self.flush_write_blocks()?;
 
